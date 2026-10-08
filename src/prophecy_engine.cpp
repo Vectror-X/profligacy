@@ -48,6 +48,7 @@
 #endif
 #include <objbase.h>
 #include <windows.h>
+#include <timeapi.h>
 
 static int prophecy_setenv(const char *name, const char *value, int overwrite)
 {
@@ -1024,6 +1025,14 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 			impl->applied_period = impl->host_timeline ? impl->worker_period.load() : 960;
 			configure_audio_producer_scheduling(impl->applied_period);
 #endif
+#if defined(_WIN32)
+			// MAME's own Windows OSD (winmain.cpp) raises the process timer resolution,
+			// but this embedded osd_common_t path skips it. Restore it so the worker's
+			// short waits (waitForRequest) wake on time instead of on the ~15.6 ms tick.
+			TIMECAPS timecaps{};
+			const bool fineTimer = timeGetDevCaps(&timecaps, sizeof(timecaps)) == TIMERR_NOERROR
+				&& timeBeginPeriod(timecaps.wPeriodMin) == TIMERR_NOERROR;
+#endif
 			std::vector<std::string> a = args; // start_frontend wants a non-const ref
 		#if defined(SDLMAME_WIN32)
 			windows_options options;
@@ -1033,6 +1042,9 @@ bool ProphecyEngine::start(const std::vector<std::string> &args)
 			prophecy_osd osd(options, impl.get());
 			osd.register_options();
 			impl->exitCode = emulator_info::start_frontend(options, osd, a);
+#if defined(_WIN32)
+			if (fineTimer) timeEndPeriod(timecaps.wPeriodMin);
+#endif
 			if (impl->worker_exit_delay_for_testing != 0)
 				std::this_thread::sleep_for(
 					std::chrono::milliseconds(impl->worker_exit_delay_for_testing));
