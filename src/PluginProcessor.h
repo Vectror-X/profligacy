@@ -613,6 +613,7 @@ private:
 	std::atomic<std::uint64_t> m_patchLoadBarrierUntilFrame { 0 };
 	std::array<std::atomic<std::uint64_t>, 2> m_activeHostNotes {};
 	bool               m_skipStateRestore = false;
+	double             m_minLatencyMs = 0.0; // PROFLIGACY_MIN_LATENCY_MS; 0 = original lead
 
 	// host!=48k resampling (engine is authoritative at 48 kHz)
 	std::vector<float>         m_rsIn[2];       // absolute native input window, preallocated

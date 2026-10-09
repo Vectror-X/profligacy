@@ -86,6 +86,10 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 	// Read diagnostics outside processBlock. Function-local static initialization and
 	// getenv() are both inappropriate on a host's real-time callback.
 	m_skipStateRestore = std::getenv("PROPHECY_EDITOR_SELFTEST") != nullptr;
+	// Optional minimum worker lead in milliseconds. Unset (or 0) keeps the original
+	// block-derived lead; a floor lets small host blocks keep the lead of a larger one.
+	if (const char *minLatency = std::getenv("PROFLIGACY_MIN_LATENCY_MS"))
+		m_minLatencyMs = std::clamp(std::strtod(minLatency, nullptr), 0.0, 100.0);
 	(void) m_engine.enableHostTimeline();
 }
 
@@ -349,8 +353,10 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 	// preceding callback must not remove the worker execution allowance. Output is
 	// explicitly delayed by this exact integer number of host samples; storage
 	// capacity is unrelated.
-	const auto nativeLead = std::max(std::ceil(std::max(samplesPerBlock, 1) * ratio),
+	const auto blockLead = std::max(std::ceil(std::max(samplesPerBlock, 1) * ratio),
 		(double) quantum) + 2 * quantum + 2;
+	const auto nativeLead = std::max(blockLead,
+		std::ceil(m_minLatencyMs * 0.001 * ProphecyEngine::kSampleRate));
 	setLatencySamples((int) std::ceil(nativeLead / ratio));
 	m_engine.setHostBlockFrames((std::uint32_t) std::ceil(std::max(samplesPerBlock, 1) * ratio));
 
