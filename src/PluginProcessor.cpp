@@ -371,6 +371,33 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 	m_timelineAttached = m_engine.readyForPlayback();
 }
 
+// Helper instances (Vectror-X fork): instance folders nvram-instances/2, /3, ...
+// The lowest folder not held by another running instance is taken and held (an
+// inter-process lock, released automatically if the host crashes). FL Studio loads
+// a project's plug-ins in the same order every time, so the second Profligacy of a
+// project finds its own banks again. A new folder starts as a copy of the main one.
+juce::File ProphecyAudioProcessor::claimInstanceNvram(const juce::File &mainNvram)
+{
+	const juce::File base = romloc::appSupportDir().getChildFile("nvram-instances");
+	for (int n = 2; n <= 64; ++n)
+	{
+		auto lock = std::make_unique<juce::InterProcessLock>("ProfligacyInstanceNvram" + juce::String(n));
+		if (!lock->enter(0)) continue;
+		const juce::File dir = base.getChildFile(juce::String(n));
+		const juce::File sys = dir.getChildFile("korgprop").getChildFile("sysram");
+		const juce::File mainSys = mainNvram.getChildFile("korgprop").getChildFile("sysram");
+		if (!sys.existsAsFile() && mainSys.existsAsFile())
+		{
+			sys.getParentDirectory().createDirectory();
+			(void) mainSys.copyFileTo(sys);
+		}
+		dir.createDirectory();
+		m_nvramSlotLock = std::move(lock);
+		return dir;
+	}
+	return mainNvram; // more than 63 helper instances: share the main memory, as the FL bridge does
+}
+
 // Boot the engine once, iff a valid ROM set can be located (env / persisted picker
 // choice / drop dir — see rom_locator.h). Without one the plugin stays silent and the
 // editor shows the first-run ROM picker; the pick then boots via setRomDirFromUser().
@@ -391,6 +418,11 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 		std::memory_order_release);
 	m_romPath   = romDir.getFullPathName();
 	m_nvramPath = romloc::nvramDirFor(romDir).getFullPathName();
+	// Multi-instance (Vectror-X fork): the first instance keeps the in-process engine
+	// and the usual battery RAM. Every further instance gets a helper process and its
+	// own battery-RAM folder, so instances never overwrite each other's banks.
+	if (!m_engine.reserveInProcess())
+		m_nvramPath = claimInstanceNvram(juce::File(m_nvramPath)).getFullPathName();
 	consumeFactoryResetFlag(); // librarian: a requested reset boots with empty battery RAM
 
 	// Headless, focus-safe MAME (see korgprophecy build/run notes).
@@ -1318,9 +1350,16 @@ juce::File librarianBackupDir()
 	return romloc::appSupportDir().getChildFile("backups");
 }
 
-juce::File factoryResetFlag()
+// Build 1 kept one global flag; now each battery-RAM folder has its own, so a
+// reset clears only the instance that asked for it.
+juce::File legacyFactoryResetFlag()
 {
 	return romloc::appSupportDir().getChildFile("factory-reset.pending");
+}
+
+juce::File factoryResetFlag(const juce::String &nvramPath)
+{
+	return juce::File(nvramPath).getChildFile("factory-reset.pending");
 }
 
 juce::String backupStamp()
@@ -1372,15 +1411,28 @@ juce::String ProphecyAudioProcessor::librarianLoadPatch(const juce::File &file)
 	juce::String error;
 	const auto messages = prophecyMessages(file, error);
 	if (messages.empty()) return error;
+	// Prefer a real edit-buffer dump (0x40). Otherwise take the first program that was
+	// saved with a slot address (0x4C) and play it from the edit buffer instead: it is
+	// heard at once and no memory slot is overwritten.
+	const librarian::Bytes *chosen = nullptr;
+	int addressedPrograms = 0;
 	for (const auto &m : messages)
 	{
-		if (librarian::functionCode(m) != librarian::kCurrentProgramDump) continue;
+		const int fn = librarian::functionCode(m);
+		if (fn == librarian::kCurrentProgramDump) { chosen = &m; addressedPrograms = 0; break; }
+		if (fn == librarian::kAddressedProgramDump && ++addressedPrograms == 1) chosen = &m;
+	}
+	if (chosen != nullptr)
+	{
+		const auto patch = librarian::asCurrentProgram(*chosen);
 		// The edit buffer is not protected memory: no unprotect, no WRITE. Paced like
 		// every other editor command so it never lands inside another transaction.
-		m_editorCommandPacer.enqueueMidi(0x30001, m.data(), m.size());
-		const auto name = librarian::programName(m);
-		return "Patch loaded: " + (name.isNotEmpty() ? name : file.getFileNameWithoutExtension())
-			+ "  (use WRITE to keep it in a program slot)";
+		m_editorCommandPacer.enqueueMidi(0x30001, patch.data(), patch.size());
+		const auto name = librarian::programName(patch);
+		juce::String note = "  (use WRITE to keep it in a program slot)";
+		if (addressedPrograms > 1)
+			note = "  (first of " + juce::String(addressedPrograms) + " programs in this file: use BANK LOAD for all)";
+		return "Patch loaded: " + (name.isNotEmpty() ? name : file.getFileNameWithoutExtension()) + note;
 	}
 	return file.getFileName() + " is " + librarian::describeFunction(librarian::functionCode(messages.front()))
 		+ ", not an individual patch: use BANK LOAD";
@@ -1544,8 +1596,9 @@ void ProphecyAudioProcessor::BankSaver::timerCallback()
 juce::String ProphecyAudioProcessor::librarianRequestFactoryReset()
 {
 	if (librarianBusy()) return "Wait: the librarian is still busy with a bank";
-	romloc::appSupportDir().createDirectory();
-	if (!factoryResetFlag().replaceWithText("factory reset requested " + backupStamp()))
+	if (m_nvramPath.isEmpty()) return "Wait for the Prophecy to finish booting, then try again";
+	juce::File(m_nvramPath).createDirectory();
+	if (!factoryResetFlag(m_nvramPath).replaceWithText("factory reset requested " + backupStamp()))
 		return "Could not schedule the factory reset";
 	return "Factory reset scheduled: reload the plugin (or reopen the project) to finish. "
 		"Your current memory will be moved to the backups folder.";
@@ -1553,8 +1606,11 @@ juce::String ProphecyAudioProcessor::librarianRequestFactoryReset()
 
 void ProphecyAudioProcessor::consumeFactoryResetFlag()
 {
-	const juce::File flag = factoryResetFlag();
-	if (!flag.existsAsFile() || m_nvramPath.isEmpty()) return;
+	if (m_nvramPath.isEmpty()) return;
+	juce::File flag = factoryResetFlag(m_nvramPath);
+	if (!flag.existsAsFile() && !m_engine.isRemote() && legacyFactoryResetFlag().existsAsFile())
+		flag = legacyFactoryResetFlag();
+	if (!flag.existsAsFile()) return;
 	// Runs before MAME starts: with no sysram the firmware re-initializes an empty
 	// battery-backed RAM, i.e. boots with its factory programs, globals and patterns.
 	const juce::File sys = juce::File(m_nvramPath).getChildFile("korgprop").getChildFile("sysram");

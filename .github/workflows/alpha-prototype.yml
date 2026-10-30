@@ -317,8 +317,15 @@ jobs:
           cmake --build build-prototype --config Release --parallel 4 --target `
             ProphecyPlugin_VST3 `
             ProphecyPlugin_Standalone `
-            ProphecyArtifactHost
+            ProphecyArtifactHost `
+            ProfligacyEngine
           if ($LASTEXITCODE -ne 0) { throw "product build exited $LASTEXITCODE" }
+          # Multi-instance helper (Vectror-X fork): it lives next to the plug-in binary.
+          $helper = 'build-prototype\ProfligacyEngine_artefacts\Release\ProfligacyEngine.exe'
+          Copy-Item -LiteralPath $helper -Destination `
+            'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win'
+          Copy-Item -LiteralPath $helper -Destination 'build-prototype\ProphecyPlugin_artefacts\Release\Standalone'
+          if (-not (Test-Path 'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win\ProfligacyEngine.exe')) { throw 'helper was not placed in the VST3 bundle' }
       - name: Run no-ROM product and publication gates
         shell: pwsh
         run: |
@@ -397,6 +404,9 @@ jobs:
             -Destination (Join-Path $package 'Profligacy.vst3')
           Copy-Item -LiteralPath `
             build-prototype\ProphecyPlugin_artefacts\Release\Standalone\Profligacy.exe `
+            -Destination $package
+          Copy-Item -LiteralPath `
+            build-prototype\ProphecyPlugin_artefacts\Release\Standalone\ProfligacyEngine.exe `
             -Destination $package
           Copy-Item -LiteralPath release\GITHUB_ALPHA_RELEASE_NOTES.md -Destination (Join-Path $package 'README.md')
           $zip = "$package.zip"

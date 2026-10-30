@@ -412,7 +412,8 @@ foreach(_fmt AU VST3 Standalone)
 endforeach()
 endif()
 
-target_sources(ProphecyPlugin PRIVATE src/PluginProcessor.cpp)
+target_sources(ProphecyPlugin PRIVATE src/PluginProcessor.cpp
+	src/engine_facade.cpp src/remote_engine.cpp src/engine_link_platform.cpp)
 
 # Embed the WebView editor's HTML/CSS/JS (single self-contained file for now).
 juce_add_binary_data(ProphecyData SOURCES
@@ -498,6 +499,14 @@ target_compile_definitions(ProphecyArtifactHost PRIVATE
 target_link_libraries(ProphecyArtifactHost PRIVATE
 	juce::juce_audio_utils juce::juce_audio_formats)
 
+# Vectror-X fork: helper engine process for the multi-instance plan (one MAME
+# machine per process). The plug-in starts one for each instance after the first;
+# run by hand it performs a self-test. Packaged next to the plug-in binary.
+juce_add_console_app(ProfligacyEngine PRODUCT_NAME "ProfligacyEngine")
+target_sources(ProfligacyEngine PRIVATE src/engine_host_main.cpp src/engine_link_platform.cpp)
+target_compile_definitions(ProfligacyEngine PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+target_link_libraries(ProfligacyEngine PRIVATE prophecy_engine juce::juce_data_structures)
+
 if(BUILD_TESTING)
 	add_executable(ProphecyLatencySequenceTest scripts/latency_sequence_test.cpp)
 	target_compile_definitions(ProphecyLatencySequenceTest PRIVATE JUCE_USE_CURL=0)
@@ -520,7 +529,7 @@ if(APPLE)
 endif()
 
 if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
-	foreach(_prophecy_windows_target prophecy_engine ProphecyPlugin ProphecyConsoleHost ProphecyMultiInstanceContractTest ProphecyEngineLifecycleTest ProphecyPluginTimingHost ProphecyPluginRtSafetyTest ProphecyArtifactHost)
+	foreach(_prophecy_windows_target prophecy_engine ProphecyPlugin ProphecyConsoleHost ProphecyMultiInstanceContractTest ProphecyEngineLifecycleTest ProphecyPluginTimingHost ProphecyPluginRtSafetyTest ProphecyArtifactHost ProfligacyEngine)
 		if(TARGET ${_prophecy_windows_target})
 			set_property(TARGET ${_prophecy_windows_target} PROPERTY
 				MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

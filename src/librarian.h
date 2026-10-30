@@ -24,15 +24,40 @@ inline bool isProphecySysex(const Bytes &m)
 inline int functionCode(const Bytes &m) { return isProphecySysex(m) ? m[4] : -1; }
 
 // Function codes seen in real files / the firmware: 0x40 current program (edit buffer),
-// 0x50 All Data (globals + 128 programs + arpeggio patterns).
-constexpr int kCurrentProgramDump = 0x40;
-constexpr int kAllDataDump        = 0x50;
+// 0x4C one program addressed to a memory slot (header bytes 5-7 = destination, packed
+// program from byte 8), 0x50 All Data (globals + 128 programs + arpeggio patterns).
+constexpr int kCurrentProgramDump   = 0x40;
+constexpr int kAddressedProgramDump = 0x4C;
+constexpr int kAllDataDump          = 0x50;
 
 inline juce::String describeFunction(int fn)
 {
-	if (fn == kCurrentProgramDump) return "Individual Patch";
-	if (fn == kAllDataDump)        return "All Data";
+	if (fn == kCurrentProgramDump)   return "Individual Patch";
+	if (fn == kAddressedProgramDump) return "Program with slot address";
+	if (fn == kAllDataDump)          return "All Data";
 	return "type 0x" + juce::String::toHexString(fn).paddedLeft('0', 2).toUpperCase();
+}
+
+// Offset of the packed program data inside a 0x40 or 0x4C message (0 = not a program).
+inline std::size_t programDataOffset(const Bytes &m)
+{
+	const int fn = isProphecySysex(m) ? m[4] : -1;
+	if (fn == kCurrentProgramDump && m.size() > 7) return 6;
+	if (fn == kAddressedProgramDump && m.size() > 9) return 8;
+	return 0;
+}
+
+// The same program as a current-program (edit buffer) dump: F0 42 3n 41 40 00 <packed> F7.
+// A 0x40 message is returned unchanged; anything else returns empty.
+inline Bytes asCurrentProgram(const Bytes &m)
+{
+	const std::size_t at = programDataOffset(m);
+	if (at == 0) return {};
+	if (m[4] == kCurrentProgramDump) return m;
+	Bytes out = {0xF0, 0x42, m[2], 0x41, (std::uint8_t) kCurrentProgramDump, 0x00};
+	out.insert(out.end(), m.begin() + (std::ptrdiff_t) at, m.end() - 1);
+	out.push_back(0xF7);
+	return out;
 }
 
 // Korg 7-in-8 unpack: a high-bit byte followed by up to seven low-7-bit bytes.
@@ -49,11 +74,12 @@ inline Bytes unpack7in8(const std::uint8_t *p, std::size_t len)
 	return out;
 }
 
-// Program name of a current-program dump: F0 42 3n 41 40 00 <packed> F7, name = first 16 bytes.
+// Program name of a 0x40 or 0x4C program dump: the first 16 unpacked bytes.
 inline juce::String programName(const Bytes &m)
 {
-	if (functionCode(m) != kCurrentProgramDump || m.size() < 8) return {};
-	const Bytes raw = unpack7in8(m.data() + 6, m.size() - 7);
+	const std::size_t at = programDataOffset(m);
+	if (at == 0) return {};
+	const Bytes raw = unpack7in8(m.data() + at, m.size() - at - 1);
 	juce::String name;
 	for (std::size_t i = 0; i < 16 && i < raw.size(); ++i)
 		name += (raw[i] >= 32 && raw[i] < 127) ? (juce::juce_wchar) raw[i] : (juce::juce_wchar) ' ';

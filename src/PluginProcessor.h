@@ -10,6 +10,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include "engine_facade.h"
 #include "prophecy_engine.h"
 
 #include <array>
@@ -122,6 +123,7 @@ public:
 	juce::String romPath() const { return m_romPath; }
 	bool setRomDirFromUser(const juce::File &dir); // validate + persist + boot; false if invalid
 	bool maybeBootEngine();                        // boot once iff a valid ROM set is locatable
+	juce::File claimInstanceNvram(const juce::File &mainNvram); // own battery-RAM folder for a helper instance
 	void selectPatch(int program);       // bank-select + program change (0..127 = A00..B63)
 	std::uint64_t currentProgramVersion() const
 	{ return m_currentProgramVersion.load(std::memory_order_acquire); }
@@ -652,7 +654,11 @@ private:
 		return accepted;
 	}
 
-	ProphecyEngine     m_engine;
+	// Holds this instance's own battery-RAM folder (helper instances only). Declared
+	// before m_engine so it is released only after the engine has written that RAM.
+	std::unique_ptr<juce::InterProcessLock> m_nvramSlotLock;
+	// In-process engine for the first instance, helper process for the others.
+	EngineFacade       m_engine;
 	// Serializes ROM-path setup and creation of the one processor-owned
 	// initialization thread. Engine lifecycle state remains in ProphecyEngine.
 	std::atomic<bool>  m_bootClaimed { false };
