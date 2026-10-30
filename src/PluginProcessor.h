@@ -206,6 +206,7 @@ public:
 	juce::String librarianLoadPatch(const juce::File &file);
 	juce::String librarianCapturePatch(std::vector<std::uint8_t> &dump, juce::String &name);
 	juce::String librarianStartBankLoad(const juce::File &file);
+	juce::String librarianStartBankSave(const juce::File &dest);
 	juce::String librarianRequestFactoryReset();
 	struct LibrarianStatus { bool busy = false; double progress = 0.0; juce::String message; };
 	LibrarianStatus librarianStatus() const;
@@ -241,6 +242,33 @@ private:
 		juce::String m_label, m_message;
 	};
 	BankLoader m_bankLoader { *this };
+	// Records the firmware's own All Data dump (reply to an All Data Dump Request) from the
+	// emulated MIDI OUT, draining the 4 KB TX queue continuously, then writes it to a file.
+	class BankSaver : private juce::Timer
+	{
+	public:
+		explicit BankSaver(ProphecyAudioProcessor &p) : m_proc(p) {}
+		~BankSaver() override { stopTimer(); }
+		bool busy() const { return m_busy; }
+		void start(const juce::File &dest);
+		double progress() const { return std::min(1.0, (double) m_rx.size() / 80390.0); }
+		juce::String message() const { return m_message; }
+	private:
+		void timerCallback() override;
+		void finish(const juce::String &message);
+		ProphecyAudioProcessor &m_proc;
+		bool m_busy = false;
+		bool m_requested = false;
+		bool m_receiving = false;
+		juce::File m_dest;
+		std::vector<std::uint8_t> m_rx;
+		double m_startMs = 0.0;
+		double m_lastByteMs = 0.0;
+		juce::String m_message;
+	};
+	BankSaver m_bankSaver { *this };
+	bool m_librarianLastWasSave = false;
+	bool librarianBusy() const { return m_bankLoader.busy() || m_bankSaver.busy(); }
 	bool librarianEngineReady() const
 	{
 		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active

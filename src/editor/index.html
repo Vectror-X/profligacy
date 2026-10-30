@@ -709,6 +709,7 @@
   <span class="libsep"></span>
   <span class="liblabel">BANK</span>
   <span class="vchip" id="lib_bank_load" title="Load a bank / All Data file (.syx / .mid); the current memory file is backed up first">LOAD</span>
+  <span class="vchip" id="lib_bank_save" title="Save the whole memory (All Data) as .syx or .mid">SAVE</span>
   <span class="libsep"></span>
   <span class="vchip" id="lib_factory" title="Back up the memory and boot with the factory sounds after a plugin reload">FACTORY RESET</span>
   <span class="libstatus" id="lib_status"></span>
@@ -3952,7 +3953,7 @@
 // Librarian bar (Vectror-X fork): LOAD/SAVE INDIVIDUAL PATCH, LOAD BANK, FACTORY RESET.
 (function(){
   const status=document.getElementById('lib_status');
-  const buttons=['lib_patch_load','lib_patch_save','lib_bank_load','lib_factory'].map(id=>document.getElementById(id));
+  const buttons=['lib_patch_load','lib_patch_save','lib_bank_load','lib_factory','lib_bank_save'].map(id=>document.getElementById(id));
   let polling=null, armTimer=null;
   function show(text){ status.textContent=text||''; status.title=text||''; }
   function setBusy(on){ buttons.forEach(b=>b.classList.toggle('libbusy',on)); }
@@ -3983,6 +3984,7 @@
   buttons[1].addEventListener('click',()=>run('librarianSavePatch'));
   buttons[2].addEventListener('click',()=>confirmClick(buttons[2],'LOAD',()=>run('librarianLoadBank',r=>{ if(r&&r.message&&r.message.startsWith('Loading')) poll(); else setBusy(false); })));
   buttons[3].addEventListener('click',()=>confirmClick(buttons[3],'FACTORY RESET',()=>run('librarianFactoryReset')));
+  buttons[4].addEventListener('click',()=>run('librarianSaveBank',r=>{ if(r&&r.message&&r.message.startsWith('Saving')) poll(); else setBusy(false); }));
 })();
 </script>
 
