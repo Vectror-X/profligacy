@@ -319,7 +319,7 @@ jobs:
             ProphecyPlugin_Standalone `
             ProphecyArtifactHost `
             ProfligacyEngine
-          if ($LASTEXITCODE -ne 0) { throw "product build exited $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::product build (VST3/standalone/ProfligacyEngine) exited $LASTEXITCODE"; throw "product build exited $LASTEXITCODE" }
           # Multi-instance helper (Vectror-X fork): it lives next to the plug-in binary.
           $helper = 'build-prototype\ProfligacyEngine_artefacts\Release\ProfligacyEngine.exe'
           Copy-Item -LiteralPath $helper -Destination `
@@ -328,10 +328,18 @@ jobs:
           if (-not (Test-Path 'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win\ProfligacyEngine.exe')) { throw 'helper was not placed in the VST3 bundle' }
           # The helper must at least start on Windows (a missing DLL entry point stops it
           # before main). Without ROMs its self-test exits 2 after printing its report.
+          # Started with Start-Process so its expected nonzero exit is read, not treated as a failure.
           $env:PROPHECY_FORCE_NO_ROM = '1'
-          & 'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win\ProfligacyEngine.exe' --no-pause
-          if ($LASTEXITCODE -ne 2) { throw "ProfligacyEngine.exe did not start correctly (exit $LASTEXITCODE)" }
+          $engine = Start-Process -FilePath 'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win\ProfligacyEngine.exe' `
+            -ArgumentList '--no-pause' -NoNewWindow -Wait -PassThru
           Remove-Item Env:PROPHECY_FORCE_NO_ROM
+          $code = $engine.ExitCode
+          Write-Host ("ProfligacyEngine.exe self-test exit code: {0} (0x{1:X8})" -f $code, $code)
+          if ($code -ne 2) {
+            Write-Host ("::error::ProfligacyEngine.exe did not start correctly: exit {0} (0x{1:X8})" -f $code, $code)
+            throw "ProfligacyEngine.exe did not start correctly"
+          }
+          $global:LASTEXITCODE = 0
       - name: Run no-ROM product and publication gates
         shell: pwsh
         run: |
