@@ -506,6 +506,17 @@
   .vchip:hover{color:#E2E7DD; background:rgba(161,163,150,.14)}
   .vchip.on{background:#A1A396; color:#121311; border-color:#70736B; font-weight:700;
     box-shadow:inset 0 1px rgba(255,255,245,.24)}
+  /* Librarian bar (Vectror-X fork): same chip look as the view chips, top-left. */
+  .libbar{position:fixed; top:6px; left:10px; z-index:30; display:flex; align-items:center; gap:4px; padding:3px;
+    border:1px solid #4D4F47; border-radius:5px; background:rgba(31,31,31,.84);
+    box-shadow:inset 0 1px rgba(255,255,255,.07),0 2px 7px rgba(0,0,0,.18); max-width:calc(100vw - 480px)}
+  .libbar .liblabel{font:600 9px/1 var(--mono); color:#7F857B; padding:0 4px 0 6px; letter-spacing:.04em; white-space:nowrap}
+  .libbar .libsep{width:1px; align-self:stretch; background:#4D4F47; margin:0 3px}
+  .libbar .vchip{white-space:nowrap}
+  .libbar .vchip.libbusy{opacity:.45; pointer-events:none}
+  .libbar .vchip.libarm{background:#8A3B2E; color:#F2E6E0; border-color:#B0553F}
+  .libbar .libstatus{font:500 10px/1.2 var(--mono); color:#C9CEC3; padding:0 6px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; min-width:0}
   .layoutlab{position:fixed; top:38px; left:12px; z-index:35; width:286px; max-height:calc(100vh - 52px);
     overflow:auto; padding:12px; border:1px solid #454941; border-radius:10px;
     color:#d8ddd3; background:rgba(18,20,18,.94); box-shadow:0 12px 38px rgba(0,0,0,.42);
@@ -690,6 +701,17 @@
   <span class="vchip" id="chip_layout" hidden>Layout</span>
   <span class="vchip" id="chip_material" hidden>Material</span>
   <span class="vchip" id="chip_dev" title="developer panel tools">Dev</span>
+</div>
+<div class="libbar" id="libbar">
+  <span class="liblabel">INDIVIDUAL PATCH</span>
+  <span class="vchip" id="lib_patch_load" title="Load a single patch (.syx / .mid) into the edit buffer">LOAD</span>
+  <span class="vchip" id="lib_patch_save" title="Save the current patch as .syx or .mid">SAVE</span>
+  <span class="libsep"></span>
+  <span class="liblabel">BANK</span>
+  <span class="vchip" id="lib_bank_load" title="Load a bank / All Data file (.syx / .mid); the current memory file is backed up first">LOAD</span>
+  <span class="libsep"></span>
+  <span class="vchip" id="lib_factory" title="Back up the memory and boot with the factory sounds after a plugin reload">FACTORY RESET</span>
+  <span class="libstatus" id="lib_status"></span>
 </div>
 
 <aside class="layoutlab" id="layoutlab" hidden>
@@ -3924,6 +3946,44 @@
     });
   });
   checkRom();
+</script>
+
+<script>
+// Librarian bar (Vectror-X fork): LOAD/SAVE INDIVIDUAL PATCH, LOAD BANK, FACTORY RESET.
+(function(){
+  const status=document.getElementById('lib_status');
+  const buttons=['lib_patch_load','lib_patch_save','lib_bank_load','lib_factory'].map(id=>document.getElementById(id));
+  let polling=null, armTimer=null;
+  function show(text){ status.textContent=text||''; status.title=text||''; }
+  function setBusy(on){ buttons.forEach(b=>b.classList.toggle('libbusy',on)); }
+  function poll(){
+    if(polling) return;
+    polling=setInterval(async()=>{
+      const r=await nativeAsync('librarianStatus');
+      if(!r) return;
+      if(r.message) show(r.message);
+      if(!r.busy){ clearInterval(polling); polling=null; setBusy(false); }
+    },300);
+  }
+  async function run(name, after){
+    setBusy(true); show('...');
+    const r=await nativeAsync(name);
+    show(r&&r.message?r.message:'');
+    if(after) after(r); else setBusy(false);
+  }
+  // Destructive actions need a second click within 4 s (no browser dialogs in a plugin window).
+  function confirmClick(button,label,action){
+    if(button.classList.contains('libarm')){
+      clearTimeout(armTimer); button.classList.remove('libarm'); button.textContent=label; action(); return;
+    }
+    button.classList.add('libarm'); button.textContent='CONFIRM?';
+    armTimer=setTimeout(()=>{ button.classList.remove('libarm'); button.textContent=label; },4000);
+  }
+  buttons[0].addEventListener('click',()=>run('librarianLoadPatch'));
+  buttons[1].addEventListener('click',()=>run('librarianSavePatch'));
+  buttons[2].addEventListener('click',()=>confirmClick(buttons[2],'LOAD',()=>run('librarianLoadBank',r=>{ if(r&&r.message&&r.message.startsWith('Loading')) poll(); else setBusy(false); })));
+  buttons[3].addEventListener('click',()=>confirmClick(buttons[3],'FACTORY RESET',()=>run('librarianFactoryReset')));
+})();
 </script>
 
 <script>

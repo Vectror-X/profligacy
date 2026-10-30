@@ -58,6 +58,7 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 #endif
 
 #include "rom_locator.h"
+#include "librarian.h"
 
 ProphecyAudioProcessor::ProphecyAudioProcessor()
 	: AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true))
@@ -86,8 +87,9 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 	// Read diagnostics outside processBlock. Function-local static initialization and
 	// getenv() are both inappropriate on a host's real-time callback.
 	m_skipStateRestore = std::getenv("PROPHECY_EDITOR_SELFTEST") != nullptr;
-	// Optional minimum worker lead in milliseconds. Unset (or 0) keeps the original
-	// block-derived lead; a floor lets small host blocks keep the lead of a larger one.
+	// Minimum worker lead in milliseconds. Default 100 ms (fork setting); the variable
+	// overrides it, and 0 restores the original block-derived lead. A floor lets small
+	// host blocks keep the lead of a larger one.
 	if (const char *minLatency = std::getenv("PROFLIGACY_MIN_LATENCY_MS"))
 		m_minLatencyMs = std::clamp(std::strtod(minLatency, nullptr), 0.0, 100.0);
 	(void) m_engine.enableHostTimeline();
@@ -389,6 +391,7 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 		std::memory_order_release);
 	m_romPath   = romDir.getFullPathName();
 	m_nvramPath = romloc::nvramDirFor(romDir).getFullPathName();
+	consumeFactoryResetFlag(); // librarian: a requested reset boots with empty battery RAM
 
 	// Headless, focus-safe MAME (see korgprophecy build/run notes).
 	setenv("SDL_VIDEODRIVER", "dummy", 1);
@@ -1304,6 +1307,290 @@ void ProphecyAudioProcessor::WriteSequence::timerCallback()
 }
 
 //============================================================
+//  Librarian (Vectror-X fork): LOAD/SAVE INDIVIDUAL PATCH, LOAD BANK, FACTORY RESET.
+//  Files are plain Korg SysEx (.syx) or Standard MIDI Files carrying the same SysEx.
+//  Every Prophecy message is re-addressed to channel 1 (3n = 0x30), like the editor.
+//============================================================
+namespace
+{
+juce::File librarianBackupDir()
+{
+	return romloc::appSupportDir().getChildFile("backups");
+}
+
+juce::File factoryResetFlag()
+{
+	return romloc::appSupportDir().getChildFile("factory-reset.pending");
+}
+
+juce::String backupStamp()
+{
+	return juce::Time::getCurrentTime().formatted("%Y-%m-%d %H-%M-%S");
+}
+
+// Last folder used by the librarian dialogs (shared by load and save, like a hardware librarian).
+juce::File librarianLastDir()
+{
+	juce::PropertiesFile props(romloc::settingsOptions());
+	const juce::File dir(props.getValue("librarianDir"));
+	return dir.isDirectory() ? dir : juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+}
+
+void rememberLibrarianDir(const juce::File &dir)
+{
+	if (!dir.isDirectory()) return;
+	juce::PropertiesFile props(romloc::settingsOptions());
+	props.setValue("librarianDir", dir.getFullPathName());
+	props.saveIfNeeded();
+}
+
+std::vector<librarian::Bytes> prophecyMessages(const juce::File &file, juce::String &error)
+{
+	juce::MemoryBlock data;
+	if (!file.loadFileAsData(data) || data.getSize() == 0)
+	{
+		error = "Could not read " + file.getFileName();
+		return {};
+	}
+	std::vector<librarian::Bytes> out;
+	for (auto &m : librarian::readSysexMessages(data))
+		if (librarian::isProphecySysex(m))
+		{
+			m[2] = 0x30; // global MIDI channel 1, as every editor message assumes
+			out.push_back(std::move(m));
+		}
+	if (out.empty())
+		error = file.getFileName() + " has no Korg Prophecy SysEx";
+	return out;
+}
+} // namespace
+
+juce::String ProphecyAudioProcessor::librarianLoadPatch(const juce::File &file)
+{
+	if (m_bankLoader.busy()) return "Wait: a bank is still loading";
+	if (!librarianEngineReady()) return "Wait for the Prophecy to finish booting, then try again";
+	juce::String error;
+	const auto messages = prophecyMessages(file, error);
+	if (messages.empty()) return error;
+	for (const auto &m : messages)
+	{
+		if (librarian::functionCode(m) != librarian::kCurrentProgramDump) continue;
+		// The edit buffer is not protected memory: no unprotect, no WRITE. Paced like
+		// every other editor command so it never lands inside another transaction.
+		m_editorCommandPacer.enqueueMidi(0x30001, m.data(), m.size());
+		const auto name = librarian::programName(m);
+		return "Patch loaded: " + (name.isNotEmpty() ? name : file.getFileNameWithoutExtension())
+			+ "  (use WRITE to keep it in a program slot)";
+	}
+	return file.getFileName() + " is " + librarian::describeFunction(librarian::functionCode(messages.front()))
+		+ ", not an individual patch: use BANK LOAD";
+}
+
+juce::String ProphecyAudioProcessor::librarianCapturePatch(std::vector<std::uint8_t> &dump, juce::String &name)
+{
+	dump.clear();
+	if (m_bankLoader.busy()) return "Wait: a bank is still loading";
+	if (!librarianEngineReady()) return "Wait for the Prophecy to finish booting, then try again";
+	// Same capture as the DAW-state path: drop stale TX, request the current program,
+	// and take the firmware's own 0x40 reply byte-for-byte.
+	std::uint8_t tmp[512];
+	while (m_engine.popMidiTx(tmp, sizeof(tmp)) > 0) {}
+	const std::uint8_t req[7] = {0xF0, 0x42, 0x30, 0x41, 0x10, 0x00, 0xF7};
+	(void) pushImmediateMidi(req, sizeof(req));
+	std::vector<std::uint8_t> tx;
+	const double deadline = juce::Time::getMillisecondCounterHiRes() + 1500.0;
+	while (dump.empty() && juce::Time::getMillisecondCounterHiRes() < deadline)
+	{
+		std::size_t g;
+		while ((g = m_engine.popMidiTx(tmp, sizeof(tmp))) > 0) tx.insert(tx.end(), tmp, tmp + g);
+		for (const auto &m : librarian::detail::scanRaw(tx.data(), tx.size()))
+			if (librarian::functionCode(m) == librarian::kCurrentProgramDump) { dump = m; break; }
+		if (dump.empty()) juce::Thread::sleep(5);
+	}
+	if (dump.empty()) return "The Prophecy did not answer the dump request; try again";
+	name = librarian::programName(dump);
+	return {};
+}
+
+juce::String ProphecyAudioProcessor::librarianStartBankLoad(const juce::File &file)
+{
+	if (m_bankLoader.busy()) return "Wait: a bank is still loading";
+	if (!librarianEngineReady()) return "Wait for the Prophecy to finish booting, then try again";
+	juce::String error;
+	const auto messages = prophecyMessages(file, error);
+	if (messages.empty()) return error;
+
+	std::vector<std::uint8_t> stream;
+	bool allData = false;
+	juce::StringArray kinds;
+	for (const auto &m : messages)
+	{
+		const int fn = librarian::functionCode(m);
+		allData = allData || fn == librarian::kAllDataDump;
+		kinds.addIfNotAlreadyThere(librarian::describeFunction(fn));
+		stream.insert(stream.end(), m.begin(), m.end());
+	}
+
+	// Backup first: the battery-RAM file as MAME last saved it (when the plugin opened).
+	if (!m_nvramPath.isEmpty())
+	{
+		const juce::File sys = juce::File(m_nvramPath).getChildFile("korgprop").getChildFile("sysram");
+		if (sys.existsAsFile())
+		{
+			librarianBackupDir().createDirectory();
+			(void) sys.copyFileTo(librarianBackupDir().getChildFile("sysram before bank load " + backupStamp()));
+		}
+	}
+	m_bankLoader.start(std::move(stream), allData, file.getFileName() + " (" + kinds.joinIntoString(", ") + ")");
+	return "Loading " + file.getFileName() + "... do not play notes until it finishes";
+}
+
+ProphecyAudioProcessor::LibrarianStatus ProphecyAudioProcessor::librarianStatus() const
+{
+	LibrarianStatus s;
+	s.busy = m_bankLoader.busy();
+	s.progress = m_bankLoader.progress();
+	s.message = m_bankLoader.message();
+	return s;
+}
+
+juce::String ProphecyAudioProcessor::librarianRequestFactoryReset()
+{
+	if (m_bankLoader.busy()) return "Wait: a bank is still loading";
+	romloc::appSupportDir().createDirectory();
+	if (!factoryResetFlag().replaceWithText("factory reset requested " + backupStamp()))
+		return "Could not schedule the factory reset";
+	return "Factory reset scheduled: reload the plugin (or reopen the project) to finish. "
+		"Your current memory will be moved to the backups folder.";
+}
+
+void ProphecyAudioProcessor::consumeFactoryResetFlag()
+{
+	const juce::File flag = factoryResetFlag();
+	if (!flag.existsAsFile() || m_nvramPath.isEmpty()) return;
+	// Runs before MAME starts: with no sysram the firmware re-initializes an empty
+	// battery-backed RAM, i.e. boots with its factory programs, globals and patterns.
+	const juce::File sys = juce::File(m_nvramPath).getChildFile("korgprop").getChildFile("sysram");
+	if (sys.existsAsFile())
+	{
+		librarianBackupDir().createDirectory();
+		(void) sys.moveFileTo(librarianBackupDir().getChildFile("sysram before factory reset " + backupStamp()));
+	}
+	(void) flag.deleteFile();
+}
+
+void ProphecyAudioProcessor::BankLoader::start(std::vector<std::uint8_t> stream, bool allData,
+	const juce::String &label)
+{
+	m_stream = std::move(stream);
+	m_sent = 0;
+	m_step = 0;
+	m_allData = allData;
+	m_label = label;
+	m_message = "Loading " + label + "...";
+	m_phase = Phase::Pre;
+	m_lastProgressMs = juce::Time::getMillisecondCounterHiRes();
+	// Nothing else may reach the UART while the SysEx stream is open.
+	m_proc.m_editorCommandPacer.holdForPatchLoad(1000);
+	startTimer(150);
+}
+
+bool ProphecyAudioProcessor::BankLoader::sendParam(int channel, int group, int param, int value)
+{
+	// Korg PARAMETER CHANGE (0x41), same encoding as setParamG(), but sent directly:
+	// the editor pacer is held for the whole transfer.
+	const std::uint8_t msg[11] = {
+		0xF0, 0x42, (std::uint8_t) (0x30 | (channel & 0x0F)), 0x41, 0x41, (std::uint8_t) (group & 0x7F),
+		(std::uint8_t) (param & 0x7F), (std::uint8_t) ((param >> 7) & 0x7F),
+		(std::uint8_t) (value & 0x7F), (std::uint8_t) ((value >> 7) & 0x7F), 0xF7};
+	return m_proc.pushImmediateMidi(msg, sizeof(msg));
+}
+
+void ProphecyAudioProcessor::BankLoader::finish(const juce::String &message)
+{
+	m_message = message;
+	m_step = 0;
+	m_phase = Phase::Post;
+	startTimer(150);
+}
+
+void ProphecyAudioProcessor::BankLoader::timerCallback()
+{
+	const double now = juce::Time::getMillisecondCounterHiRes();
+	m_proc.m_editorCommandPacer.extendPatchLoad(1000);
+	switch (m_phase)
+	{
+	case Phase::Idle:
+		stopTimer();
+		return;
+	case Phase::Pre:
+		// Program and Arpeggio Pattern Memory Protect off (Global params 170/171, as
+		// writePatch() and the Arp editor do). Retry a step if the queue is momentarily busy.
+		if (m_step == 0 && sendParam(0, 0, 170, 0)) ++m_step;
+		else if (m_step == 1 && sendParam(0, 0, 171, 0)) ++m_step;
+		else if (m_step >= 2)
+		{
+			m_phase = Phase::Stream;
+			m_lastProgressMs = now;
+			startTimer(10);
+		}
+		return;
+	case Phase::Stream:
+	{
+		// Keep the 4 KB UART queue topped up so the stream has no gaps (another
+		// producer could otherwise slip bytes in between two chunks).
+		for (int i = 0; i < 8 && m_sent < m_stream.size(); ++i)
+		{
+			const std::size_t n = std::min<std::size_t>(256, m_stream.size() - m_sent);
+			if (!m_proc.pushImmediateMidi(m_stream.data() + m_sent, n)) break;
+			m_sent += n;
+			m_lastProgressMs = now;
+		}
+		const int percent = (int) std::lround(progress() * 100.0);
+		m_message = "Loading " + m_label + "... " + juce::String(percent) + "%";
+		if (m_sent >= m_stream.size())
+		{
+			// The last 4 KB still has to cross the 31250-baud UART, and the firmware
+			// writes the data into backup memory as it arrives.
+			m_phase = Phase::Settle;
+			m_settleUntilMs = now + 4000.0;
+			startTimer(250);
+		}
+		else if (now - m_lastProgressMs > 30000.0)
+			finish("Failed: the Prophecy stopped accepting data (is the plugin processing audio?)");
+		return;
+	}
+	case Phase::Settle:
+		m_message = "Loading " + m_label + "... writing to memory";
+		if (now >= m_settleUntilMs)
+			finish("Bank loaded: " + m_label + ". Program names in the browser refresh after reloading the plugin.");
+		return;
+	case Phase::Post:
+	{
+		// An All Data dump also overwrites the Global section: bring the global MIDI
+		// channel back to 1 (sent on all 16 channels; only the active one applies it),
+		// then restore Memory Protect (hardware default ON).
+		bool ok = true;
+		if (m_step == 0)
+		{
+			if (m_allData)
+				for (int ch = 0; ch < 16 && ok; ++ch) ok = sendParam(ch, 0, 184, 0);
+			if (ok) ++m_step;
+		}
+		else if (m_step == 1 && sendParam(0, 0, 170, 1)) ++m_step;
+		else if (m_step == 2 && sendParam(0, 0, 171, 1)) ++m_step;
+		else if (m_step >= 3)
+		{
+			m_phase = Phase::Idle;
+			stopTimer();
+			m_proc.requestProgramDump(); // refresh the editor's view
+		}
+		return;
+	}
+	}
+}
+
+//============================================================
 //  WebView editor: an HTML/CSS/JS panel (embedded via BinaryData). The JS calls the
 //  registered native function "selectPatch"; C++ -> JS events come later for LCD/params.
 //============================================================
@@ -1848,7 +2135,89 @@ window.addEventListener('load', () => window.__JUCE__.backend.emitEvent('proflig
 							complete(juce::var(obj));
 						});
 				})
+			// Librarian (Vectror-X fork). Each returns {message} for the status line.
+			.withNativeFunction("librarianLoadPatch",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					openLibrarianFile("Load individual patch (.syx / .mid)", complete,
+						[this](const juce::File &f) { return m_proc.librarianLoadPatch(f); });
+				})
+			.withNativeFunction("librarianLoadBank",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					openLibrarianFile("Load bank (.syx / .mid)", complete,
+						[this](const juce::File &f) { return m_proc.librarianStartBankLoad(f); });
+				})
+			.withNativeFunction("librarianSavePatch",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					auto dump = std::make_shared<std::vector<std::uint8_t>>();
+					juce::String name;
+					const juce::String error = m_proc.librarianCapturePatch(*dump, name);
+					if (error.isNotEmpty()) { complete(librarianResult(error)); return; }
+					const juce::String fileName = juce::File::createLegalFileName(
+						name.isNotEmpty() ? name : juce::String("Prophecy patch")) + ".syx";
+					m_chooser = std::make_unique<juce::FileChooser>(
+						"Save individual patch (.syx or .mid)",
+						librarianLastDir().getChildFile(fileName), "*.syx;*.mid");
+					m_chooser->launchAsync(
+						juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+							| juce::FileBrowserComponent::warnAboutOverwriting,
+						[complete, dump](const juce::FileChooser &fc)
+						{
+							juce::File dest = fc.getResult();
+							if (dest == juce::File()) { complete(librarianResult("Save cancelled")); return; }
+							const auto ext = dest.getFileExtension().toLowerCase();
+							if (ext != ".syx" && ext != ".mid" && ext != ".midi") dest = dest.withFileExtension(".syx");
+							rememberLibrarianDir(dest.getParentDirectory());
+							const bool ok = librarian::writeSysexFile(dest, {*dump});
+							complete(librarianResult(ok ? "Patch saved: " + dest.getFileName()
+								: "Could not write " + dest.getFullPathName()));
+						});
+				})
+			.withNativeFunction("librarianFactoryReset",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					complete(librarianResult(m_proc.librarianRequestFactoryReset()));
+				})
+			.withNativeFunction("librarianStatus",
+				[this](const juce::Array<juce::var> &args, juce::WebBrowserComponent::NativeFunctionCompletion complete)
+				{
+					juce::ignoreUnused(args);
+					const auto s = m_proc.librarianStatus();
+					auto *obj = new juce::DynamicObject();
+					obj->setProperty("busy", s.busy);
+					obj->setProperty("progress", s.progress);
+					obj->setProperty("message", s.message);
+					complete(juce::var(obj));
+				})
 	};
+
+	static juce::var librarianResult(const juce::String &message)
+	{
+		auto *obj = new juce::DynamicObject();
+		obj->setProperty("message", message);
+		return juce::var(obj);
+	}
+
+	void openLibrarianFile(const juce::String &title, juce::WebBrowserComponent::NativeFunctionCompletion complete,
+		std::function<juce::String(const juce::File &)> action)
+	{
+		m_chooser = std::make_unique<juce::FileChooser>(title, librarianLastDir(), "*.syx;*.mid;*.midi");
+		m_chooser->launchAsync(
+			juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+			[complete, action](const juce::FileChooser &fc)
+			{
+				const juce::File f = fc.getResult();
+				if (f == juce::File()) { complete(librarianResult("Cancelled")); return; }
+				rememberLibrarianDir(f.getParentDirectory());
+				complete(librarianResult(action(f)));
+			});
+	}
 	std::unique_ptr<juce::FileChooser> m_chooser;
 };
 

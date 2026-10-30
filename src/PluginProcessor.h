@@ -201,7 +201,53 @@ public:
 		std::uint32_t *version, int *pattern) const
 	{ return m_engine.latestArpeggioPatternData(out, cap, version, pattern); }
 
+	// Librarian (Vectror-X fork): .syx/.mid patch and bank files. Message-thread only.
+	// Each call returns a short status line for the editor (empty string never means failure).
+	juce::String librarianLoadPatch(const juce::File &file);
+	juce::String librarianCapturePatch(std::vector<std::uint8_t> &dump, juce::String &name);
+	juce::String librarianStartBankLoad(const juce::File &file);
+	juce::String librarianRequestFactoryReset();
+	struct LibrarianStatus { bool busy = false; double progress = 0.0; juce::String message; };
+	LibrarianStatus librarianStatus() const;
+
 private:
+	// Streams a bank file (tens of KB) into the 4 KB UART queue in order, after clearing
+	// Program/Arpeggio Memory Protect, then restores protection (the hardware default,
+	// as writePatch() does). Editor commands are held for the whole transfer so no other
+	// bytes interleave with the SysEx stream.
+	class BankLoader : private juce::Timer
+	{
+	public:
+		explicit BankLoader(ProphecyAudioProcessor &p) : m_proc(p) {}
+		~BankLoader() override { stopTimer(); }
+		bool busy() const { return m_phase != Phase::Idle; }
+		void start(std::vector<std::uint8_t> stream, bool allData, const juce::String &label);
+		double progress() const
+		{ return m_stream.empty() ? 0.0 : (double) m_sent / (double) m_stream.size(); }
+		juce::String message() const { return m_message; }
+	private:
+		enum class Phase { Idle, Pre, Stream, Settle, Post };
+		void timerCallback() override;
+		bool sendParam(int channel, int group, int param, int value);
+		void finish(const juce::String &message);
+		ProphecyAudioProcessor &m_proc;
+		Phase m_phase = Phase::Idle;
+		std::vector<std::uint8_t> m_stream;
+		std::size_t m_sent = 0;
+		int m_step = 0;
+		bool m_allData = false;
+		double m_lastProgressMs = 0.0;
+		double m_settleUntilMs = 0.0;
+		juce::String m_label, m_message;
+	};
+	BankLoader m_bankLoader { *this };
+	bool librarianEngineReady() const
+	{
+		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active
+			&& m_engine.producedFrames() >= (std::uint64_t) ProphecyEngine::kSampleRate * 11;
+	}
+	void consumeFactoryResetFlag();
+
 	class PerformanceParameter final : public juce::AudioParameterInt
 	{
 	public:
@@ -613,7 +659,7 @@ private:
 	std::atomic<std::uint64_t> m_patchLoadBarrierUntilFrame { 0 };
 	std::array<std::atomic<std::uint64_t>, 2> m_activeHostNotes {};
 	bool               m_skipStateRestore = false;
-	double             m_minLatencyMs = 0.0; // PROFLIGACY_MIN_LATENCY_MS; 0 = original lead
+	double             m_minLatencyMs = 100.0; // PROFLIGACY_MIN_LATENCY_MS overrides; 0 = original lead
 
 	// host!=48k resampling (engine is authoritative at 48 kHz)
 	std::vector<float>         m_rsIn[2];       // absolute native input window, preallocated
