@@ -506,6 +506,14 @@ juce_add_console_app(ProfligacyEngine PRODUCT_NAME "ProfligacyEngine")
 target_sources(ProfligacyEngine PRIVATE src/engine_host_main.cpp src/engine_link_platform.cpp)
 target_compile_definitions(ProfligacyEngine PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
 target_link_libraries(ProfligacyEngine PRIVATE prophecy_engine juce::juce_data_structures)
+if(WIN32 AND NOT PROPHECY_USE_FAKE_ENGINE)
+	# MAME's Windows OSD imports Common Controls v6 entry points (comctl32 ordinal
+	# 344, TaskDialogIndirect). JUCE GUI targets add this dependency themselves;
+	# this console helper links no GUI module, so it must ask for it like the
+	# other MAME executables above, or Windows refuses to start it.
+	target_link_options(ProfligacyEngine PRIVATE
+		"/MANIFESTDEPENDENCY:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+endif()
 
 if(BUILD_TESTING)
 	add_executable(ProphecyLatencySequenceTest scripts/latency_sequence_test.cpp)

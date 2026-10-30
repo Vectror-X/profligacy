@@ -326,6 +326,12 @@ jobs:
             'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win'
           Copy-Item -LiteralPath $helper -Destination 'build-prototype\ProphecyPlugin_artefacts\Release\Standalone'
           if (-not (Test-Path 'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win\ProfligacyEngine.exe')) { throw 'helper was not placed in the VST3 bundle' }
+          # The helper must at least start on Windows (a missing DLL entry point stops it
+          # before main). Without ROMs its self-test exits 2 after printing its report.
+          $env:PROPHECY_FORCE_NO_ROM = '1'
+          & 'build-prototype\ProphecyPlugin_artefacts\Release\VST3\Profligacy.vst3\Contents\x86_64-win\ProfligacyEngine.exe' --no-pause
+          if ($LASTEXITCODE -ne 2) { throw "ProfligacyEngine.exe did not start correctly (exit $LASTEXITCODE)" }
+          Remove-Item Env:PROPHECY_FORCE_NO_ROM
       - name: Run no-ROM product and publication gates
         shell: pwsh
         run: |
