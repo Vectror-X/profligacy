@@ -100,9 +100,13 @@ static int activeAudioTest()
 		{
 			// Prime the same real worker and ring off the watched realtime callback.
 			// This avoids turning a no-allocation test into a scheduling benchmark.
+			// Prime past the reported latency too: the read position trails the host
+			// by that lead (100 ms by default in this fork), so 16 small blocks alone
+			// would still be reading before the engine's first frame.
 			block.setSize(2, prepared, false, false, true);
 			processor.setNonRealtime(true);
-			for (int prime = 0; prime < 16; ++prime) processor.processBlock(block, empty);
+			const int primes = 16 + (processor.getLatencySamples() + prepared - 1) / prepared;
+			for (int prime = 0; prime < primes; ++prime) processor.processBlock(block, empty);
 			processor.setNonRealtime(false);
 			block.setSize(2, std::min(count, prepared), false, false, true);
 			const auto before = processor.diagnosticSnapshot();
