@@ -681,6 +681,7 @@ private:
 	std::vector<std::uint8_t> m_lastStateDump;
 	juce::String       m_romPath;             // resolved ROM dir once booted
 	juce::String       m_nvramPath;           // resolved NVRAM dir once booted
+	juce::String       m_mainNvramPath;       // the shared main bank (first instance's NVRAM dir)
 	double             m_hostSampleRate = 48000.0;
 	prophecy::SampleTimeline m_timeline;
 	std::uint64_t      m_timelineHostFrame = 0;

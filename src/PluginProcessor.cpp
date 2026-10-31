@@ -61,6 +61,14 @@ static int prophecy_setenv(const char *name, const char *value, int overwrite)
 #include "rom_locator.h"
 #include "librarian.h"
 
+namespace
+{
+// Librarian helpers defined further down (Vectror-X fork).
+juce::File legacyFactoryResetFlag();
+juce::File factoryResetFlag(const juce::String &nvramPath);
+juce::File librarianPatchesDir();
+}
+
 ProphecyAudioProcessor::ProphecyAudioProcessor()
 	: AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
@@ -94,6 +102,7 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 	if (const char *minLatency = std::getenv("PROFLIGACY_MIN_LATENCY_MS"))
 		m_minLatencyMs = std::clamp(std::strtod(minLatency, nullptr), 0.0, 100.0);
 	(void) m_engine.enableHostTimeline();
+	(void) librarianPatchesDir().createDirectory(); // Documents\Profligacy\Patches, for LOAD/SAVE
 	m_idleThread = std::thread([this] { idleClockLoop(); });
 }
 
@@ -424,9 +433,10 @@ void ProphecyAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 
 // Helper instances (Vectror-X fork): instance folders nvram-instances/2, /3, ...
 // The lowest folder not held by another running instance is taken and held (an
-// inter-process lock, released automatically if the host crashes). FL Studio loads
-// a project's plug-ins in the same order every time, so the second Profligacy of a
-// project finds its own banks again. A new folder starts as a copy of the main one.
+// inter-process lock, released automatically if the host crashes). Shared bank: on
+// every boot the folder gets a fresh copy of the main battery RAM, so programs
+// written in the first instance appear in all of them. What a helper instance writes
+// at exit stays in its own folder and is replaced at its next boot.
 juce::File ProphecyAudioProcessor::claimInstanceNvram(const juce::File &mainNvram)
 {
 	const juce::File base = romloc::appSupportDir().getChildFile("nvram-instances");
@@ -437,11 +447,13 @@ juce::File ProphecyAudioProcessor::claimInstanceNvram(const juce::File &mainNvra
 		const juce::File dir = base.getChildFile(juce::String(n));
 		const juce::File sys = dir.getChildFile("korgprop").getChildFile("sysram");
 		const juce::File mainSys = mainNvram.getChildFile("korgprop").getChildFile("sysram");
-		if (!sys.existsAsFile() && mainSys.existsAsFile())
-		{
-			sys.getParentDirectory().createDirectory();
-			(void) mainSys.copyFileTo(sys);
-		}
+		sys.getParentDirectory().createDirectory();
+		// A factory reset waiting for the first instance means "empty RAM" here too.
+		if (mainSys.existsAsFile() && !factoryResetFlag(mainNvram.getFullPathName()).existsAsFile()
+				&& !legacyFactoryResetFlag().existsAsFile())
+			(void) mainSys.copyFileTo(sys); // replaces the previous copy
+		else
+			(void) sys.deleteFile();
 		dir.createDirectory();
 		m_nvramSlotLock = std::move(lock);
 		return dir;
@@ -469,9 +481,11 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 		std::memory_order_release);
 	m_romPath   = romDir.getFullPathName();
 	m_nvramPath = romloc::nvramDirFor(romDir).getFullPathName();
+	m_mainNvramPath = m_nvramPath;
 	// Multi-instance (Vectror-X fork): the first instance keeps the in-process engine
-	// and the usual battery RAM. Every further instance gets a helper process and its
-	// own battery-RAM folder, so instances never overwrite each other's banks.
+	// and the usual battery RAM. Every further instance gets a helper process that
+	// boots from a fresh copy of that same bank (shared bank, as with FL's bridge),
+	// in a folder of its own so it never writes over the main bank.
 	if (!m_engine.reserveInProcess())
 		m_nvramPath = claimInstanceNvram(juce::File(m_nvramPath)).getFullPathName();
 	consumeFactoryResetFlag(); // librarian: a requested reset boots with empty battery RAM
@@ -1475,10 +1489,21 @@ juce::File &librarianDirMemory()
 	return dir;
 }
 
+// Fixed patch folder, like Gearmulator's and TUS's: Documents\Profligacy\Patches.
+// Created when the plug-in opens; never stored in the settings file.
+juce::File librarianPatchesDir()
+{
+	return juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+		.getChildFile("Profligacy").getChildFile("Patches");
+}
+
 juce::File librarianLastDir()
 {
 	const juce::File dir = librarianDirMemory();
-	return dir.isDirectory() ? dir : juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+	if (dir.isDirectory()) return dir;
+	const juce::File patches = librarianPatchesDir();
+	(void) patches.createDirectory();
+	return patches.isDirectory() ? patches : juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
 }
 
 void rememberLibrarianDir(const juce::File &dir)
@@ -1704,9 +1729,10 @@ void ProphecyAudioProcessor::BankSaver::timerCallback()
 juce::String ProphecyAudioProcessor::librarianRequestFactoryReset()
 {
 	if (librarianBusy()) return "Wait: the librarian is still busy with a bank";
-	if (m_nvramPath.isEmpty()) return "Wait for the Prophecy to finish booting, then try again";
-	juce::File(m_nvramPath).createDirectory();
-	if (!factoryResetFlag(m_nvramPath).replaceWithText("factory reset requested " + backupStamp()))
+	// Shared bank: a reset always targets the main bank (all instances boot from it).
+	if (m_mainNvramPath.isEmpty()) return "Wait for the Prophecy to finish booting, then try again";
+	juce::File(m_mainNvramPath).createDirectory();
+	if (!factoryResetFlag(m_mainNvramPath).replaceWithText("factory reset requested " + backupStamp()))
 		return "Could not schedule the factory reset";
 	return "Factory reset scheduled: reload the plugin (or reopen the project) to finish. "
 		"Your current memory will be moved to the backups folder.";
@@ -1714,7 +1740,7 @@ juce::String ProphecyAudioProcessor::librarianRequestFactoryReset()
 
 void ProphecyAudioProcessor::consumeFactoryResetFlag()
 {
-	if (m_nvramPath.isEmpty()) return;
+	if (m_nvramPath.isEmpty() || m_engine.isRemote()) return; // the first instance owns the main bank
 	juce::File flag = factoryResetFlag(m_nvramPath);
 	if (!flag.existsAsFile() && !m_engine.isRemote() && legacyFactoryResetFlag().existsAsFile())
 		flag = legacyFactoryResetFlag();
