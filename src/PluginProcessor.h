@@ -693,6 +693,21 @@ private:
 	std::mutex         m_initializationMutex;
 	std::condition_variable m_initializationChanged;
 	std::thread        m_initializationThread;
+	// Idle clock (Vectror-X fork). The Prophecy's clock only advances while the host
+	// calls processBlock. A host that sleeps a silent instance (FL Smart Disable,
+	// transport stopped) would freeze the machine with a LOAD, WRITE or project patch
+	// still queued. While the host is away this thread keeps the machine running in
+	// real time, like powered hardware; processBlock re-anchors its timeline when the
+	// host returns. The machine's audio produced meanwhile is simply not heard.
+	void idleClockLoop();
+	void maybeInjectPendingStateFromIdle();
+	std::thread               m_idleThread;
+	std::atomic<bool>         m_idleStop { false };
+	std::atomic<bool>         m_inProcessBlock { false };
+	std::atomic<bool>         m_lastBlockOffline { false };
+	std::atomic<double>       m_lastProcessMs { 0.0 };
+	std::atomic<bool>         m_idleClockMoved { false };
+	std::atomic_flag          m_engineReader = ATOMIC_FLAG_INIT; // one engine reader at a time
 	std::atomic<std::uint64_t> m_oversizedAudioBlocks { 0 };
 	// Lock-free counters sampled by the optional GUI diagnostic logger. The audio callback
 	// only updates atomics; all formatting and file I/O stays on the message thread.

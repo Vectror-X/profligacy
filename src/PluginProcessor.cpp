@@ -16,6 +16,7 @@
 #include "BinaryData.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +94,54 @@ ProphecyAudioProcessor::ProphecyAudioProcessor()
 	if (const char *minLatency = std::getenv("PROFLIGACY_MIN_LATENCY_MS"))
 		m_minLatencyMs = std::clamp(std::strtod(minLatency, nullptr), 0.0, 100.0);
 	(void) m_engine.enableHostTimeline();
+	m_idleThread = std::thread([this] { idleClockLoop(); });
+}
+
+void ProphecyAudioProcessor::idleClockLoop()
+{
+	std::vector<float> left(256), right(256);
+	bool active = false;
+	double startMs = 0.0;
+	std::uint64_t base = 0;
+	while (!m_idleStop.load(std::memory_order_acquire))
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		const double now = juce::Time::getMillisecondCounterHiRes();
+		const bool hostAway = !m_inProcessBlock.load(std::memory_order_acquire)
+			&& !m_lastBlockOffline.load(std::memory_order_acquire)
+			&& now - m_lastProcessMs.load(std::memory_order_acquire) > 100.0;
+		if (!hostAway || !m_engine.readyForPlayback())
+		{
+			active = false;
+			continue;
+		}
+		if (!active)
+		{
+			active = true;
+			startMs = now;
+			base = m_engine.requestedFrames();
+		}
+		const auto target = base + (std::uint64_t) ((now - startMs) * (ProphecyEngine::kSampleRate / 1000.0));
+		m_idleClockMoved.store(true, std::memory_order_release);
+		if (m_inProcessBlock.load(std::memory_order_acquire)) continue; // the host just came back
+		m_engine.requestThroughFrame(target + 4096);
+		// Consume (discard) the machine's output so it never waits for a reader.
+		if (target > left.size() && !m_engineReader.test_and_set(std::memory_order_acquire))
+		{
+			(void) m_engine.readAtFrame(target - left.size(), left.data(), right.data(), left.size(), false);
+			m_engineReader.clear(std::memory_order_release);
+		}
+		maybeInjectPendingStateFromIdle();
+	}
+}
+
+// A project patch restored while the host never processed this instance.
+void ProphecyAudioProcessor::maybeInjectPendingStateFromIdle()
+{
+	if (m_skipStateRestore || !m_pendingReady.load() || !firmwareBooted()) return;
+	if (m_pendingInjected.exchange(true)) return;
+	if (!pushImmediateMidi(m_pendingState.data(), m_pendingState.size()))
+		m_pendingInjected.store(false);
 }
 
 ProphecyAudioProcessor::PerformanceParameter::PerformanceParameter(
@@ -158,6 +207,8 @@ void ProphecyAudioProcessor::applyPendingPerformanceParameters(std::uint64_t fra
 
 ProphecyAudioProcessor::~ProphecyAudioProcessor()
 {
+	m_idleStop.store(true, std::memory_order_release);
+	if (m_idleThread.joinable()) m_idleThread.join();
 	m_engine.requestStop();
 	if (m_initializationThread.joinable()) m_initializationThread.join();
 	m_engine.stop();
@@ -490,6 +541,21 @@ bool ProphecyAudioProcessor::setRomDirFromUser(const juce::File &dir)
 void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce::MidiBuffer &midi)
 {
 	juce::ScopedNoDenormals noDenormals;
+	// Idle clock bookkeeping: the host is here (see idleClockLoop).
+	struct HostPresence
+	{
+		ProphecyAudioProcessor &p;
+		explicit HostPresence(ProphecyAudioProcessor &owner) : p(owner)
+		{
+			p.m_inProcessBlock.store(true, std::memory_order_release);
+			p.m_lastBlockOffline.store(p.isNonRealtime(), std::memory_order_release);
+		}
+		~HostPresence()
+		{
+			p.m_lastProcessMs.store(juce::Time::getMillisecondCounterHiRes(), std::memory_order_release);
+			p.m_inProcessBlock.store(false, std::memory_order_release);
+		}
+	} hostPresence(*this);
 	const int numSamples  = buffer.getNumSamples();
 	const int numChannels = buffer.getNumChannels();
 	bool engineActive = m_engine.readyForPlayback();
@@ -513,6 +579,15 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 		if (m_lateBootStartsFreshEpoch.exchange(false, std::memory_order_acq_rel))
 			m_timelineHostFrame = 0;
 		m_timelineAttached = true;
+	}
+	if (engineActive && m_idleClockMoved.exchange(false, std::memory_order_acq_rel))
+	{
+		// The machine kept running while the host was away: start a fresh audible epoch
+		// after everything the idle clock granted, with the same fixed delay as a boot.
+		const auto quantum = ProphecyEngine::kAudioQuantum;
+		const auto origin = ((m_engine.requestedFrames() + quantum - 1) / quantum) * quantum;
+		m_timeline.reset(m_hostSampleRate, origin);
+		m_timelineHostFrame = 0;
 	}
 	m_audioCallbacks.fetch_add(1, std::memory_order_relaxed);
 	m_audioHostFrames.fetch_add((std::uint64_t) std::max(numSamples, 0), std::memory_order_relaxed);
@@ -628,10 +703,10 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	// had its historical safety margin. The timeline only changes the absolute
 	// frame used for the same one-shot SysEx injection.
 	if (!m_skipStateRestore && engineActive && m_pendingReady.load() && !m_pendingInjected.load()
-			&& firmwareBooted())
+			&& firmwareBooted() && !m_pendingInjected.exchange(true))
 	{
-		if (m_engine.pushMidiAtFrame(m_pendingState.data(), m_pendingState.size(), midiFrameBase))
-			m_pendingInjected.store(true);
+		if (!m_engine.pushMidiAtFrame(m_pendingState.data(), m_pendingState.size(), midiFrameBase))
+			m_pendingInjected.store(false);
 	}
 	m_timelineHostFrame += (std::uint64_t) numSamples;
 	if (engineActive) m_engine.requestThroughFrame(m_timeline.horizon(m_timelineHostFrame));
@@ -663,8 +738,15 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 		m_audioUnderrunFrames.fetch_add((std::uint64_t) outputCount, std::memory_order_relaxed);
 		return;
 	}
+	// The idle clock may be finishing one discard read as the host returns; never wait.
+	if (m_engineReader.test_and_set(std::memory_order_acquire))
+	{
+		m_audioUnderrunFrames.fetch_add((std::uint64_t) outputCount, std::memory_order_relaxed);
+		return;
+	}
 	const auto got = m_engine.readAtFrame(m_timeline.origin() + windowStart,
 		m_rsIn[0].data(), m_rsIn[1].data(), needed, isNonRealtime());
+	m_engineReader.clear(std::memory_order_release);
 	m_audioEngineFrames.fetch_add(got, std::memory_order_relaxed);
 	m_audioUnderrunFrames.fetch_add(needed - got, std::memory_order_relaxed);
 
@@ -1449,6 +1531,11 @@ juce::String ProphecyAudioProcessor::librarianLoadPatch(const juce::File &file)
 		// The edit buffer is not protected memory: no unprotect, no WRITE. Paced like
 		// every other editor command so it never lands inside another transaction.
 		m_editorCommandPacer.enqueueMidi(0x30001, patch.data(), patch.size());
+		{
+			// A project save that gets no fresh dump keeps this patch.
+			std::lock_guard lock(m_lastStateDumpMutex);
+			m_lastStateDump = patch;
+		}
 		const auto name = librarian::programName(patch);
 		juce::String note = "  (use WRITE to keep it in a program slot)";
 		if (addressedPrograms > 1)

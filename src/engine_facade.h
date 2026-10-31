@@ -12,6 +12,7 @@
 #include "prophecy_engine.h"
 #include "remote_engine.h"
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 
@@ -49,8 +50,17 @@ public:
 	std::uint64_t playbackOrigin() const { return m_useRemote ? m_remote->playbackOrigin() : m_local.playbackOrigin(); }
 	void setHostBlockFrames(std::uint32_t nativeFrames)
 	{ if (m_useRemote) m_remote->setHostBlockFrames(nativeFrames); else m_local.setHostBlockFrames(nativeFrames); }
+	// Grants only move forward: the plug-in's audio thread and its idle clock may both
+	// grant, and a late smaller grant must never pull the machine's horizon back.
 	void requestThroughFrame(std::uint64_t exclusiveEnd)
-	{ if (m_useRemote) m_remote->requestThroughFrame(exclusiveEnd); else m_local.requestThroughFrame(exclusiveEnd); }
+	{
+		if (m_useRemote) { m_remote->requestThroughFrame(exclusiveEnd); return; }
+		auto current = m_maxGrant.load(std::memory_order_relaxed);
+		while (exclusiveEnd > current
+			&& !m_maxGrant.compare_exchange_weak(current, exclusiveEnd, std::memory_order_acq_rel)) {}
+		const auto grant = std::max(m_maxGrant.load(std::memory_order_acquire), m_local.requestedFrames());
+		m_local.requestThroughFrame(grant);
+	}
 	std::uint64_t requestedFrames() const { return m_useRemote ? m_remote->requestedFrames() : m_local.requestedFrames(); }
 	std::size_t readAtFrame(std::uint64_t first, float *left, float *right, std::size_t frames, bool offline)
 	{
@@ -118,5 +128,6 @@ private:
 	bool m_ownsInProcessSlot = false;
 	bool m_useRemote = false;
 	bool m_hostTimeline = false;
+	std::atomic<std::uint64_t> m_maxGrant{0};
 	static std::atomic<bool> s_inProcessTaken;
 };
