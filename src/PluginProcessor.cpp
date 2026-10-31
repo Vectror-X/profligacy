@@ -1384,20 +1384,24 @@ juce::String backupStamp()
 	return juce::Time::getCurrentTime().formatted("%Y-%m-%d %H-%M-%S");
 }
 
-// Last folder used by the librarian dialogs (shared by load and save, like a hardware librarian).
+// Last folder used by the librarian dialogs (shared by load and save, like a hardware
+// librarian). Kept in memory only, for as long as the host runs: nothing is written to
+// the settings file, which the user edits by hand.
+juce::File &librarianDirMemory()
+{
+	static juce::File dir;
+	return dir;
+}
+
 juce::File librarianLastDir()
 {
-	juce::PropertiesFile props(romloc::settingsOptions());
-	const juce::File dir(props.getValue("librarianDir"));
+	const juce::File dir = librarianDirMemory();
 	return dir.isDirectory() ? dir : juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
 }
 
 void rememberLibrarianDir(const juce::File &dir)
 {
-	if (!dir.isDirectory()) return;
-	juce::PropertiesFile props(romloc::settingsOptions());
-	props.setValue("librarianDir", dir.getFullPathName());
-	props.saveIfNeeded();
+	if (dir.isDirectory()) librarianDirMemory() = dir;
 }
 
 std::vector<librarian::Bytes> prophecyMessages(const juce::File &file, juce::String &error)
