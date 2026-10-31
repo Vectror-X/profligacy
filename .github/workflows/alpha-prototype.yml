@@ -12,6 +12,11 @@ on:
           - both
           - macos-arm64
           - windows-x64
+      label:
+        description: Short build name for the Windows download (optional), e.g. engine-fix-patches-in-projects
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: alpha-release-${{ github.ref }}-${{ inputs.target }}
@@ -429,7 +434,7 @@ jobs:
           "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -Encoding ascii -NoNewline "$zip.sha256"
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: Profligacy-1.0.0-alpha.8-Windows-x64-experimental-${{ github.sha }}
+          name: ${{ inputs.label != '' && format('Profligacy-{0}', inputs.label) || format('Profligacy-1.0.0-alpha.8-Windows-x64-experimental-{0}', github.sha) }}
           path: |
             ${{ runner.temp }}/Profligacy-1.0.0-alpha.8-Windows-x64-experimental.zip
             ${{ runner.temp }}/Profligacy-1.0.0-alpha.8-Windows-x64-experimental.zip.sha256
