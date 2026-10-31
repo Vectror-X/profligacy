@@ -271,10 +271,21 @@ private:
 	BankSaver m_bankSaver { *this };
 	bool m_librarianLastWasSave = false;
 	bool librarianBusy() const { return m_bankLoader.busy() || m_bankSaver.busy(); }
+	// Firmware ready for SysEx (Vectror-X fork). With the startup handshake the engine
+	// itself proves the firmware booted (program page on the LCD, identity reply,
+	// program dump), so nothing waits for 11 s of host-driven audio any more: a host
+	// that sleeps a silent plug-in (FL Smart Disable) would otherwise stop that clock
+	// and leave a reopened project stuck. Without the handshake (clean-room CI
+	// firmware) the original 11 s margin still applies.
+	bool firmwareBooted() const
+	{
+		return m_engine.readyForPlayback()
+			&& (m_firmwareHandshake.load(std::memory_order_acquire)
+				|| m_engine.producedFrames() >= (std::uint64_t) ProphecyEngine::kSampleRate * 11);
+	}
 	bool librarianEngineReady() const
 	{
-		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active
-			&& m_engine.producedFrames() >= (std::uint64_t) ProphecyEngine::kSampleRate * 11;
+		return m_engine.instanceStatus() == ProphecyEngine::InstanceStatus::Active && firmwareBooted();
 	}
 	void consumeFactoryResetFlag();
 
@@ -662,6 +673,12 @@ private:
 	// Serializes ROM-path setup and creation of the one processor-owned
 	// initialization thread. Engine lifecycle state remains in ProphecyEngine.
 	std::atomic<bool>  m_bootClaimed { false };
+	std::atomic<bool>  m_firmwareHandshake { false }; // boot used the firmware handshake
+	// Last known edit-buffer dump for project saves (message thread): a save while the
+	// host has the plug-in asleep, or before a reopened project's patch was delivered,
+	// keeps the patch instead of writing a project without it.
+	std::mutex                m_lastStateDumpMutex;
+	std::vector<std::uint8_t> m_lastStateDump;
 	juce::String       m_romPath;             // resolved ROM dir once booted
 	juce::String       m_nvramPath;           // resolved NVRAM dir once booted
 	double             m_hostSampleRate = 48000.0;

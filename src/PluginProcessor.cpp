@@ -456,6 +456,7 @@ bool ProphecyAudioProcessor::maybeBootEngine()
 		// Clean-room CI firmware has its own sentinel protocol, not Korg's boot
 		// screen or SysEx parser. Ordinary firmware must complete the handshake.
 		const bool firmware = std::getenv("PROFLIGACY_CI_EXPOSE_LCD_STATE") == nullptr;
+		m_firmwareHandshake.store(firmware, std::memory_order_release);
 		m_initializationState.store(InitializationState::Running, std::memory_order_release);
 		m_initializationThread = std::thread([this, firmware] {
 			const bool ready = m_engine.initializePlayback(firmware);
@@ -627,7 +628,7 @@ void ProphecyAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce
 	// had its historical safety margin. The timeline only changes the absolute
 	// frame used for the same one-shot SysEx injection.
 	if (!m_skipStateRestore && engineActive && m_pendingReady.load() && !m_pendingInjected.load()
-			&& m_engine.producedFrames() > (std::uint64_t) ProphecyEngine::kSampleRate * 11)
+			&& firmwareBooted())
 	{
 		if (m_engine.pushMidiAtFrame(m_pendingState.data(), m_pendingState.size(), midiFrameBase))
 			m_pendingInjected.store(true);
@@ -746,8 +747,7 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 	// Exact edit-buffer recall is part of a DAW project save. The standalone has the
 	// hardware-like policy instead: only an explicit front-panel WRITE persists a patch.
 	std::vector<std::uint8_t> dump;
-	if (wrapperType != juce::AudioProcessor::wrapperType_Standalone
-			&& m_engine.producedFrames() >= (std::uint64_t) ProphecyEngine::kSampleRate * 11)
+	if (wrapperType != juce::AudioProcessor::wrapperType_Standalone && firmwareBooted())
 	{
 		std::uint8_t tmp[512];
 		while (m_engine.popMidiTx(tmp, sizeof(tmp)) > 0) {}                    // drop stale TX
@@ -770,6 +770,15 @@ void ProphecyAudioProcessor::getStateInformation(juce::MemoryBlock &dest)
 			}
 			if (!got) juce::Thread::sleep(5);
 		}
+	}
+
+	// No fresh reply (the host may be keeping the plug-in asleep, or the patch restored
+	// from the project has not reached the firmware yet): keep the last known patch.
+	if (wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+	{
+		std::lock_guard lock(m_lastStateDumpMutex);
+		if (!dump.empty()) m_lastStateDump = dump;
+		else dump = m_lastStateDump;
 	}
 
 	// Header + mapping (non-Off CC entries) + the stable performance-parameter bank.
@@ -897,6 +906,14 @@ void ProphecyAudioProcessor::setStateInformation(const void *data, int size)
 
 	if (dumpLen > 0)
 	{
+		{
+			// Only the Prophecy SysEx part (a CI marker may follow it).
+			std::lock_guard lock(m_lastStateDumpMutex);
+			int sysexEnd = 0;
+			while (sysexEnd < dumpLen && dump[sysexEnd] != 0xF7) ++sysexEnd;
+			if (dump[0] == 0xF0 && sysexEnd < dumpLen)
+				m_lastStateDump.assign(dump, dump + sysexEnd + 1);
+		}
 		m_pendingState.assign(dump, dump + dumpLen);
 		m_pendingInjected.store(false);
 		m_pendingReady.store(true); // release: m_pendingState fully written before processBlock reads it
